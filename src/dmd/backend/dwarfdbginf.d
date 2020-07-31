@@ -664,47 +664,29 @@ static if (1)
      */
     void writeDebugFrameHeader(Outbuffer *buf)
     {
-        static struct DebugFrameHeader
-        {
-          align (1):
-            uint length;
-            uint CIE_id;
-            ubyte version_;
-            ubyte augmentation;
-            ubyte code_alignment_factor;
-            ubyte data_alignment_factor;
-            ubyte return_address_register;
-            ubyte[11] opcodes;
-        }
-        static assert(DebugFrameHeader.sizeof == 24);
+        writeUnitLength(buf, I64 ? 20 : 16);                        // unit length
+        append_addr(buf, I64 ? 0xffffffffffffffff : 0xffffffff);    // CIE id
+        buf.writeByte(4);                                           // version
+        buf.writeByte(0);                                           // augmentation
+        buf.writeByte(I64 ? 8 : 4);                                 // address size
+        buf.writeByte(0);                                           // segment selector size
+        buf.writeByte(1);                                           // code alignement factor
+        buf.writeByte(I64 ? 0x78 : 0x7c);                           // data alignement factor
+        buf.writeByte(I64 ? 16 : 8);                                // return address register
+        // TODO:
+        buf.writeByte(0);                                           // initial instructions
 
-        __gshared DebugFrameHeader debugFrameHeader =
-        {   16,             // length
-            0xFFFFFFFF,     // CIE_id
-            1,              // version_
-            0,              // augmentation
-            1,              // code alignment factor
-            0x7C,           // data alignment factor (-4)
-            8,              // return address register
-            [
-                DW_CFA_def_cfa, 4,4,    // r4,4 [r7,8]
-                DW_CFA_offset   +8,1,   // r8,1 [r16,1]
-                DW_CFA_nop, DW_CFA_nop,
-                DW_CFA_nop, DW_CFA_nop, // 64 padding
-                DW_CFA_nop, DW_CFA_nop, // 64 padding
-            ]
-        };
-        if (I64)
-        {   debugFrameHeader.length = 20;
-            debugFrameHeader.data_alignment_factor = 0x78;          // (-8)
-            debugFrameHeader.return_address_register = 16;
-            debugFrameHeader.opcodes[1] = 7;                        // RSP
-            debugFrameHeader.opcodes[2] = 8;
-            debugFrameHeader.opcodes[3] = DW_CFA_offset + 16;       // RIP
-        }
-        assert(debugFrameHeader.data_alignment_factor == 0x80 - OFFSET_FAC);
+        ubyte[11] padding =
+        [
+            DW_CFA_def_cfa,
+            I64 ? 7 : 4, I64 ? 8 : 4,           // r4,4 [r7, 8]
+            DW_CFA_offset + (I64 ? 16 : 8), 1,  // r8,1 [r16,1]
+            DW_CFA_nop, DW_CFA_nop,
+            DW_CFA_nop, DW_CFA_nop, // 64 padding
+            DW_CFA_nop, DW_CFA_nop, // 64 padding
+        ];
 
-        buf.writen(&debugFrameHeader,debugFrameHeader.length + 4);
+        buf.write(padding.ptr, padding.length);                      // padding
     }
 
     /*****************************************
