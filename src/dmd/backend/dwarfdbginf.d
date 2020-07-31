@@ -609,6 +609,66 @@ static if (1)
         DebugLineHeader debugline;
 
         public uint[TYMAX] typidx_tab;
+
+    /*****************************************
+     * Replace the bytes in `buf` from the `offset` by `data`.
+     *
+     * Params:
+     *      buf = buffer where `data` will be written
+     *      offset = offset of the bytes in `buf` to replace
+     *      data = bytes to write
+     */
+    extern(D) void rewrite32(Outbuffer* buf, uint offset, uint data)
+    {
+        ulong end = offset + data.sizeof;
+        for(uint i = 0; i < end - offset; ++i)
+            buf.buf[offset + i] = (data >> (8 * i)) & 0xff;
+    }
+
+    /// Ditto
+    extern(D) void rewrite64(Outbuffer* buf, uint offset, ulong data)
+    {
+        ulong end = offset + data.sizeof;
+        for(uint i = 0; i < end - offset; ++i)
+            buf.buf[offset + i] = (data >> (8 * i)) & 0xff;
+    }
+
+    /*****************************************
+     * Replace the `length` header in `buf`.
+     * `writeUnitLength` must be called first.
+     *
+     * Params:
+     *      buf = buffer where the `length` will be written
+     *      length = length to write
+     *
+     * See_Also:
+     *      writeUnitLength
+     */
+    void rewriteUnitLength(Outbuffer* buf, size_t length)
+    {
+        if (I64)
+            rewrite64(buf, 4, length - 12); // minus unit_length's length
+        else
+            rewrite32(buf, 0, cast(uint)length - 4); // Ditto
+    }
+
+    /*****************************************
+     * Append `length` to `buf` according to the DWARF v5 specification,
+     * chapter 7.2.2 Initial Length Values
+     *
+     * Params:
+     *      buf = buffer where the `length` will be written
+     *      length = length to write
+     * See_Also:
+     *      rewriteUnitLength
+     */
+    void writeUnitLength(Outbuffer* buf, size_t length = 0)
+    {
+        if (I64)
+            buf.write32(0xffffffff);    // initial length
+        else
+            assert(length < 0xfffffff0);
+        append_addr(buf, length);       // actual length
     }
 
     /*****************************************
