@@ -2949,42 +2949,56 @@ static if (1)
 
     /* ======================= Abbreviation Codes ====================== */
 
-    extern(D) uint dwarf_abbrev_code(const(ubyte)[] data)
-    {
-        return dwarf_abbrev_code(data.ptr, data.length);
-    }
-
     uint dwarf_abbrev_code(const(ubyte)* data, size_t nbytes)
     {
-        if (!abbrev_table)
-            /* uint[Adata] abbrev_table;
+        return dwarf_abbrev_code(data[0 .. nbytes]);
+    }
+
+    extern(D) uint dwarf_abbrev_code(const(ubyte)[] data)
+    {
+        return dwarf_abbrev_code_backend(data, abbrev_table,
+            abbrevcode, debug_abbrev.buf);
+    }
+
+    extern(D) uint dwarf_names_abbrev_code(const(ubyte)[] data)
+    {
+        return dwarf_abbrev_code_backend(data, nAbbrevTable,
+            nAbbrevCode, nAbbrevBuffer);
+    }
+
+    extern(D) uint dwarf_abbrev_code_backend(const(ubyte)[] data,
+        ref AApair* abbrevTable, ref uint counter, ref Outbuffer* buffer)
+    {
+        if (!abbrevTable)
+            /* uint[Adata] abbrevTable;
              * where the table values are the abbreviation codes.
              */
-            abbrev_table = AApair.create(&debug_abbrev.buf.buf);
+            abbrevTable = AApair.create(&buffer.buf);
 
-        /* Write new entry into debug_abbrev.buf
-         */
 
-        uint idx = cast(uint)debug_abbrev.buf.length();
-        abbrevcode++;
-        debug_abbrev.buf.writeuLEB128(abbrevcode);
-        size_t start = debug_abbrev.buf.length();
-        debug_abbrev.buf.write(data, cast(uint)nbytes);
-        size_t end = debug_abbrev.buf.length();
 
-        /* If debug_abbrev.buf.buf[idx .. length()] is already in debug_abbrev.buf,
+        // Write new entry into buffer
+
+        uint idx = cast(uint) buffer.length();
+        counter++;
+        buffer.writeuLEB128(counter);
+        size_t start = buffer.length();
+        buffer.write(data);
+        size_t end = buffer.length();
+
+        /* If debug_abbrev.buf.buf[idx .. length()] is already in buffer,
          * discard this one and use the previous one.
          */
 
-        uint *pcode = abbrev_table.get(cast(uint)start, cast(uint)end);
+        uint* pcode = abbrevTable.get(cast(uint)start, cast(uint)end);
         if (!*pcode)                // if no code assigned yet
         {
-            *pcode = abbrevcode;    // assign newly computed code
+            *pcode = counter;    // assign newly computed code
         }
         else
         {   // Reuse existing code
-            debug_abbrev.buf.setsize(idx);        // discard current
-            abbrevcode--;
+            buffer.setsize(idx);        // discard current
+            counter--;
         }
         return *pcode;
     }
