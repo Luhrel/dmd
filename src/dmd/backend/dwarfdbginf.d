@@ -1111,6 +1111,16 @@ static if (1)
         {
             debug_str.initialize();
         }
+        /* *********************************************************************
+         *                     7.26 Strings Offset Table
+         ******************************************************************** */
+        {
+            debug_str_offsets.initialize();
+
+            writeUnitLength(debug_str_offsets.buf, 0);  // unit length
+            debug_str_offsets.buf.write16(5);           // version
+            debug_str_offsets.buf.write16(0);           // padding
+        }
         /* ======================================== */
 
         debug_ranges.initialize();
