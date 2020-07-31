@@ -1103,11 +1103,14 @@ static if (1)
             symbol_reset(s);
         resetSyms.reset();
 
-        /* ======================================== */
 
-        debug_str.initialize();
-        //Outbuffer *debug_str_buf = debug_str.buf;
 
+        /* *********************************************************************
+         *                          String Table
+         ******************************************************************** */
+        {
+            debug_str.initialize();
+        }
         /* ======================================== */
 
         debug_ranges.initialize();
