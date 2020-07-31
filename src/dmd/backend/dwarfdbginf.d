@@ -509,27 +509,37 @@ static if (1)
 
         static if (MACHOBJ)
         {
-            Section debug_pubnames = { name: "__debug_pubnames" };
-            Section debug_aranges  = { name: "__debug_aranges" };
-            Section debug_ranges   = { name: "__debug_ranges" };
-            Section debug_loc      = { name: "__debug_loc" };
-            Section debug_abbrev   = { name: "__debug_abbrev" };
-            Section debug_info     = { name: "__debug_info" };
-            Section debug_str      = { name: "__debug_str" };
-        // We use S_REGULAR to make sure the linker doesn't remove this section. Needed
-        // for filenames and line numbers in backtraces.
-            Section debug_line     = { name: "__debug_line", flags: S_REGULAR };
+            Section debug_names         = { name: "__debug_names" };
+            Section debug_aranges       = { name: "__debug_aranges" };
+            Section debug_rnglists      = { name: "__debug_rnglists" };
+            Section debug_loclists      = { name: "__debug_loclists" };
+            Section debug_abbrev        = { name: "__debug_abbrev" };
+            Section debug_info          = { name: "__debug_info" };
+            Section debug_str           = { name: "__debug_str" };
+            Section debug_macro         = { name: "__debug_macro" };
+            Section debug_addr          = { name: "__debug_addr" };
+            Section debug_str_offsets   = { name: "__debug_str_offsets" };
+            Section debug_line_str      = { name: "__debug_line_str" };
+            // We use S_REGULAR to make sure the linker doesn't remove this section. Needed
+            // for filenames and line numbers in backtraces.
+            Section debug_line          = { name: "__debug_line", flags: S_REGULAR };
+
+            const char* debug_frame_name = "__debug_frame";
         }
         else static if (ELFOBJ)
         {
-            Section debug_pubnames = { name: ".debug_pubnames" };
-            Section debug_aranges  = { name: ".debug_aranges" };
-            Section debug_ranges   = { name: ".debug_ranges" };
-            Section debug_loc      = { name: ".debug_loc" };
-            Section debug_abbrev   = { name: ".debug_abbrev" };
-            Section debug_info     = { name: ".debug_info" };
-            Section debug_str      = { name: ".debug_str" };
-            Section debug_line     = { name: ".debug_line" };
+            Section debug_names         = { name: ".debug_names" };
+            Section debug_aranges       = { name: ".debug_aranges" };
+            Section debug_rnglists      = { name: ".debug_rnglists" };
+            Section debug_loclists      = { name: ".debug_loclists" };
+            Section debug_abbrev        = { name: ".debug_abbrev" };
+            Section debug_info          = { name: ".debug_info" };
+            Section debug_str           = { name: ".debug_str" };
+            Section debug_macro         = { name: ".debug_macro" };
+            Section debug_addr          = { name: ".debug_addr" };
+            Section debug_str_offsets   = { name: ".debug_str_offsets" };
+            Section debug_line_str      = { name: ".debug_line_str" };
+            Section debug_line          = { name: ".debug_line" };
         }
         else
         {
