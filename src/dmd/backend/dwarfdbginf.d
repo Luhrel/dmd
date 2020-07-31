@@ -563,9 +563,9 @@ static if (1)
         /* DWARF 7.5.3: "Each declaration begins with an unsigned LEB128 number
          * representing the abbreviation code itself."
          */
-        uint abbrevcode = 1;
+        uint abbrevcode;
         AApair *abbrev_table;
-        int hasModname;    // 1 if has DW_TAG_module
+        bool hasModname;    // if has DW_TAG_module
 
         // .debug_info
         AAchars *infoFileName_table;
@@ -573,20 +573,6 @@ static if (1)
         AApair *type_table;
         AApair *functype_table;  // not sure why this cannot be combined with type_table
         Outbuffer *functypebuf;
-
-        struct DebugInfoHeader
-        {
-          align (1):
-            uint total_length  = 0;
-            ushort version_    = 3;
-            uint abbrev_offset = 0;
-            ubyte address_size = 4;
-        }
-
-        // https://issues.dlang.org/show_bug.cgi?id=16563
-        static assert(DebugInfoHeader.alignof == 1 && DebugInfoHeader.sizeof == 11);
-
-        DebugInfoHeader debuginfo;
 
         // .debug_line
         size_t linebuf_filetab_end;
@@ -1104,7 +1090,6 @@ static if (1)
         resetSyms.reset();
 
 
-
         /* *********************************************************************
          *                          String Table
          ******************************************************************** */
@@ -1172,78 +1157,110 @@ static if (1)
             AApair.destroy(abbrev_table);
             abbrev_table = null;
         }
-
-        static immutable ubyte[21] abbrevHeader =
-        [
-            1,                      // abbreviation code
-            DW_TAG_compile_unit,
-            1,
-            DW_AT_producer,  DW_FORM_string,
-            DW_AT_language,  DW_FORM_data1,
-            DW_AT_name,      DW_FORM_string,
-            DW_AT_comp_dir,  DW_FORM_string,
-            DW_AT_low_pc,    DW_FORM_addr,
-            DW_AT_entry_pc,  DW_FORM_addr,
-            DW_AT_ranges,    DW_FORM_data4,
-            DW_AT_stmt_list, DW_FORM_data4,
-            0,               0,
-        ];
-
-        debug_abbrev.buf.write(abbrevHeader.ptr,abbrevHeader.sizeof);
-
-        /* ======================================== */
-
-        debug_info.initialize();
-
-        debuginfo = DebugInfoHeader.init;
-        if (I64)
-            debuginfo.address_size = 8;
-
-        // https://issues.dlang.org/show_bug.cgi?id=16563
-        assert(debuginfo.alignof == 1);
-        debug_info.buf.write(&debuginfo, debuginfo.sizeof);
-
-        static if (ELFOBJ)
-            dwarf_addrel(debug_info.seg,6,debug_abbrev.seg);
-
-        debug_info.buf.writeuLEB128(1);                   // abbreviation code
-
-        version (MARS)
+        /* *********************************************************************
+         *                     7.5.3 Abbreviations Tables
+         ******************************************************************** */
         {
-            debug_info.buf.write("Digital Mars D ");
-            debug_info.buf.writeString(config._version);     // DW_AT_producer
+            debug_abbrev.initialize();
+
+            // Free only if starting another file. Waste of time otherwise.
+            if (abbrev_table)
+            {
+                AApair.destroy(abbrev_table);
+                abbrev_table = null;
+            }
+
+            // Abbrev table of the compilation unit
+            // Chapter 3.1.1 Full and Partial Compilation Unit Entries
+            immutable ubyte[22] abbrevHeader =
+            [
+                DW_TAG_compile_unit,    DW_CHILDREN_yes,
+                DW_AT_low_pc,           DW_FORM_addr,
+                DW_AT_name,             DW_FORM_string,
+                DW_AT_language,         DW_FORM_data1,
+                DW_AT_comp_dir,         DW_FORM_string,
+                DW_AT_producer,         DW_FORM_string,
+                DW_AT_identifier_case,  DW_FORM_data1,
+                DW_AT_use_UTF8,         DW_FORM_flag,
+                DW_AT_main_subprogram,  DW_FORM_flag,
+                DW_AT_entry_pc,         DW_FORM_addr,
+                0,                      0,
+            ];
+
+            abbrevcode = 0;
+            dwarf_abbrev_code(abbrevHeader);
+        }
+        /* *********************************************************************
+         *             7.5.1.1 Full and Partial Compilation Unit Headers
+         ******************************************************************** */
+        {
+            debug_info.initialize();
+
+            /* ================== Compilation Unit Header =================== */
+
+            writeUnitLength(debug_info.buf, 0);         // unit length
+            debug_info.buf.write16(5);                  // version
+            debug_info.buf.writeByte(DW_UT_compile);    // Unit Type
+            debug_info.buf.writeByte(I64 ? 8 : 4);      // Address size
+            append_addr(debug_info.buf, 0);             // debug abbrev offset
+
+            /* ================ END Compilation Unit Header ================= */
+
+            CUoffset = debug_info.buf.length;
+
+            /* ====================== Compilation Unit ====================== */
+
+            assert(abbrevcode == 1);
+            debug_info.buf.writeuLEB128(abbrevcode);            // abbreviation code
+            append_addr(debug_info.buf, 0);                     // DW_AT_low_pc
+            debug_info.buf.writeString(filename);               // DW_AT_name
+
             // DW_AT_language
-            debug_info.buf.writeByte((config.fulltypes == CVDWARF_D) ? DW_LANG_D : DW_LANG_C89);
-        }
-        else version (SCPP)
-        {
-            debug_info.buf.write("Digital Mars C ");
-            debug_info.buf.writeString(global._version);      // DW_AT_producer
-            debug_info.buf.writeByte(DW_LANG_C89);            // DW_AT_language
-        }
-        else
-            static assert(0);
+            version(MARS)
+                debug_info.buf.writeByte((config.fulltypes == CVDWARF_D) ? DW_LANG_D : DW_LANG_C89);
+            else version(SCPP)
+                debug_info.buf.writeByte(DW_LANG_C89);
+            else
+                static assert(0);
 
-        debug_info.buf.writeString(filename);             // DW_AT_name
 
-        char* cwd = getcwd(null, 0);
-        debug_info.buf.writeString(cwd);                  // DW_AT_comp_dir as DW_FORM_string
-        free(cwd);
+            // TODO: data4 -> offset (x2)
+            //append_addr(debug_info.buf, 0);                   // DW_AT_stmt_list
+            //append_addr(debug_info.buf, 0);                   // DW_AT_macros
 
-        append_addr(debug_info.buf, 0);               // DW_AT_low_pc
-        append_addr(debug_info.buf, 0);               // DW_AT_entry_pc
+            char* cwd = getcwd(null, 0);
+            debug_info.buf.writeString(cwd);                    // DW_AT_comp_dir as DW_FORM_string
+            free(cwd);
 
-        static if (ELFOBJ)
-            dwarf_addrel(debug_info.seg,debug_info.buf.length(),debug_ranges.seg);
+            // DW_AT_producer
+            version (MARS)
+            {
+                debug_info.buf.write("Digital Mars D ");
+                debug_info.buf.write(config._version);
+            }
+            else version (SCPP)
+            {
+                debug_info.buf.write("Digital Mars C ");
+                debug_info.buf.writeString(global._version);
+            }
+            else
+                static assert(0);
 
-        debug_info.buf.write32(0);                        // DW_AT_ranges
+            debug_info.buf.writeByte(DW_ID_case_sensitive);     // DW_AT_identifier_case
+
+
+            debug_info.buf.writeByte(1);                        // DW_AT_use_UTF8
+            // TODO: set to 1 if file contains the main function
+            debug_info.buf.writeByte(0);                        // DW_AT_main_subprogram
+            append_addr(debug_info.buf, 0);                     // DW_AT_entry_pc
 
         static if (ELFOBJ)
             dwarf_addrel(debug_info.seg,debug_info.buf.length(),debug_line.seg);
 
-        debug_info.buf.write32(0);                        // DW_AT_stmt_list
 
         memset(typidx_tab.ptr, 0, typidx_tab.sizeof);
+            /* ==================== END Compilation Unit ==================== */
+        }
 
         /* ======================================== */
 
@@ -1319,19 +1336,17 @@ static if (1)
     {
         if (modname)
         {
-            static immutable ubyte[6] abbrevModule =
+            static immutable ubyte[] abbrevModule =
             [
-                DW_TAG_module,
-                //1,                // one children
-                0,                  // no children
-                DW_AT_name,         DW_FORM_string, // module name
-                0,                  0,
+                DW_TAG_module, DW_CHILDREN_no, // children
+                DW_AT_name,    DW_FORM_string, // module name
+                0,             0,
             ];
-            abbrevcode++;
-            debug_abbrev.buf.writeuLEB128(abbrevcode);
-            debug_abbrev.buf.write(abbrevModule.ptr, abbrevModule.sizeof);
-            debug_info.buf.writeuLEB128(abbrevcode);      // abbreviation code
-            debug_info.buf.writeString(modname);          // DW_AT_name
+
+            uint code = dwarf_abbrev_code(abbrevModule);
+
+            debug_info.buf.writeuLEB128(code);      // abbreviation code
+            debug_info.buf.writeString(modname);    // DW_AT_name
             //hasModname = 1;
         }
         else
@@ -1500,13 +1515,11 @@ static if (1)
 
         /* ================================================= */
 
-        debug_info.buf.writeByte(0);      // ending abbreviation code
+        /* ========================== debug_info ============================ */
 
-        debuginfo.total_length = cast(uint)debug_info.buf.length() - 4;
+        debug_info.buf.writeByte(0);    // ending abbreviation code
 
-        // https://issues.dlang.org/show_bug.cgi?id=16563
-        assert(debuginfo.alignof == 1);
-        memcpy(debug_info.buf.buf, &debuginfo, debuginfo.sizeof);
+        rewriteUnitLength(debug_info.buf, debug_info.buf.length());
 
         /* ================================================= */
 
@@ -1751,10 +1764,10 @@ static if (1)
 
         // DW_AT_frame_base
         static if (ELFOBJ)
-            dwarf_apprel32(debug_info.seg, debug_info.buf, debug_loc.seg, debug_loc.buf.length());
+            dwarf_apprel32(debug_info.seg, debug_info.buf, debug_loclists.seg, debug_loclists.buf.length());
         else
             // 64-bit DWARF relocations don't work for OSX64 codegen
-            debug_info.buf.write32(cast(uint)debug_loc.buf.length());
+            debug_info.buf.write32(cast(uint)debug_loclists.buf.length());
 
         if (haveparameters)
         {
