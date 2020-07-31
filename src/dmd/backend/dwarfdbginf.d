@@ -1260,18 +1260,24 @@ static if (1)
 
         /* ======================================== */
 
-        debug_aranges.initialize();
+        /* *********************************************************************
+         *                     7.21 Address Range Table
+         *                     6.1.2 Lookup by Address
+         ******************************************************************** */
+        {
+            debug_aranges.initialize();
 
-        debug_aranges.buf.write32(0);              // unit_length
-        debug_aranges.buf.write16(2);            // version_
+            writeUnitLength(debug_aranges.buf, 0);      // unit length
+            debug_aranges.buf.write16(2);               // version
 
-        static if (ELFOBJ)
-            dwarf_addrel(debug_aranges.seg,debug_aranges.buf.length(),debug_info.seg);
+            static if (ELFOBJ)
+                dwarf_addrel(debug_aranges.seg, debug_aranges.buf.length(), debug_info.seg);
 
-        debug_aranges.buf.write32(0);              // debug_info_offset
-        debug_aranges.buf.writeByte(I64 ? 8 : 4);  // address_size
-        debug_aranges.buf.writeByte(0);            // segment_size
-        debug_aranges.buf.write32(0);              // pad to 16
+            debug_aranges.buf.write32(0);              // debug_info_offset
+            debug_aranges.buf.writeByte(I64 ? 8 : 4);  // address_size
+            debug_aranges.buf.writeByte(0);            // segment_size
+            debug_aranges.buf.write32(0);              // pad to 16
+        }
     }
 
 
