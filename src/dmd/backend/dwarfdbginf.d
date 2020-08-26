@@ -2629,6 +2629,8 @@ static if (ELFOBJ || MACHOBJ)
                 if (t.Tflags & (TFsizeunknown | TFforward))
                 {
                     abbrevTypeStruct1[0] = dwarf_classify_struct(st.Sflags);
+                    //if (t.tnext)
+                    //    abbrevTypeStruct1[1] = 1;
                     code = dwarf_abbrev_code(abbrevTypeStruct1.ptr, (abbrevTypeStruct1).sizeof);
                     idx = cast(uint)debug_info.buf.length();
                     debug_info.buf.writeuLEB128(code);
