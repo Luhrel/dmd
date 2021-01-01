@@ -2575,6 +2575,8 @@ static if (1)
                     (DW_AT_GNU_vector & 0x7F) | 0x80, DW_AT_GNU_vector >> 7,
                     DW_FORM_flag,
                     DW_AT_type,             DW_FORM_ref4,
+                    DW_AT_decl_file,        DW_FORM_data1,
+                    DW_AT_decl_line,        DW_FORM_data2,
                     0,                      0,
                 ];
                 static immutable ubyte[6] abbrevSubRange =
@@ -2593,6 +2595,8 @@ static if (1)
                 debug_info.buf.writeuLEB128(code2);       // DW_TAG_array_type
                 debug_info.buf.writeByte(1);              // DW_AT_GNU_vector
                 debug_info.buf.write32(idxbase);          // DW_AT_type
+                debug_info.buf.writeByte(1);              // DW_AT_decl_file
+                debug_info.buf.write16(1);                // DW_AT_decl_line
 
                 // vector length stored as subrange type
                 code2 = dwarf_abbrev_code(abbrevSubRange.ptr, (abbrevSubRange).sizeof);
@@ -2613,7 +2617,7 @@ static if (1)
                 debug_info.buf.writeString("wchar_t");    // DW_AT_name
                 debug_info.buf.write32(typebase);         // DW_AT_type
                 debug_info.buf.writeByte(1);              // DW_AT_decl_file
-                debug_info.buf.write16(1);                // DW_AT_decl_line
+                debug_info.buf.write16(1);                // DW_AT_decl_line <- this is false ?
                 typidx_tab[ty] = idx;
                 break;
             }
