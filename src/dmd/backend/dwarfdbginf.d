@@ -63,6 +63,7 @@ static if (1)
     import dmd.backend.code_x86;
     import dmd.backend.dwarf;
     import dmd.backend.dwarf2;
+    import dmd.backend.dwarfeh : sLEB128size;
     import dmd.backend.mem;
     import dmd.backend.dlist;
     import dmd.backend.el;
@@ -239,6 +240,15 @@ static if (1)
             assert(0);
     }
 
+    /**
+     * Append a relocatable address (`targseg`) to `seg` at an offset.
+     *
+     * Params:
+     *      seg     = where the address is going
+     *      buf     = offset within seg (length is used)
+     *      targseg = segment to relocate
+     *      val     = addend or displacement from address
+     */
     void dwarf_appreladdr(int seg, Outbuffer *buf, int targseg, targ_size_t val)
     {
         if (I64)
@@ -509,27 +519,37 @@ static if (1)
 
         static if (MACHOBJ)
         {
-            Section debug_pubnames = { name: "__debug_pubnames" };
-            Section debug_aranges  = { name: "__debug_aranges" };
-            Section debug_ranges   = { name: "__debug_ranges" };
-            Section debug_loc      = { name: "__debug_loc" };
-            Section debug_abbrev   = { name: "__debug_abbrev" };
-            Section debug_info     = { name: "__debug_info" };
-            Section debug_str      = { name: "__debug_str" };
-        // We use S_REGULAR to make sure the linker doesn't remove this section. Needed
-        // for filenames and line numbers in backtraces.
-            Section debug_line     = { name: "__debug_line", flags: S_REGULAR };
+            Section debug_names         = { name: "__debug_names" };
+            Section debug_aranges       = { name: "__debug_aranges" };
+            Section debug_rnglists      = { name: "__debug_rnglists" };
+            Section debug_loclists      = { name: "__debug_loclists" };
+            Section debug_abbrev        = { name: "__debug_abbrev" };
+            Section debug_info          = { name: "__debug_info" };
+            Section debug_str           = { name: "__debug_str" };
+            Section debug_macro         = { name: "__debug_macro" };
+            Section debug_addr          = { name: "__debug_addr" };
+            Section debug_str_offsets   = { name: "__debug_str_offsets" };
+            Section debug_line_str      = { name: "__debug_line_str" };
+            // We use S_REGULAR to make sure the linker doesn't remove this section. Needed
+            // for filenames and line numbers in backtraces.
+            Section debug_line          = { name: "__debug_line", flags: S_REGULAR };
+
+            const char* debug_frame_name = "__debug_frame";
         }
         else static if (ELFOBJ)
         {
-            Section debug_pubnames = { name: ".debug_pubnames" };
-            Section debug_aranges  = { name: ".debug_aranges" };
-            Section debug_ranges   = { name: ".debug_ranges" };
-            Section debug_loc      = { name: ".debug_loc" };
-            Section debug_abbrev   = { name: ".debug_abbrev" };
-            Section debug_info     = { name: ".debug_info" };
-            Section debug_str      = { name: ".debug_str" };
-            Section debug_line     = { name: ".debug_line" };
+            Section debug_names         = { name: ".debug_names" };
+            Section debug_aranges       = { name: ".debug_aranges" };
+            Section debug_rnglists      = { name: ".debug_rnglists" };
+            Section debug_loclists      = { name: ".debug_loclists" };
+            Section debug_abbrev        = { name: ".debug_abbrev" };
+            Section debug_info          = { name: ".debug_info" };
+            Section debug_str           = { name: ".debug_str" };
+            Section debug_macro         = { name: ".debug_macro" };
+            Section debug_addr          = { name: ".debug_addr" };
+            Section debug_str_offsets   = { name: ".debug_str_offsets" };
+            Section debug_line_str      = { name: ".debug_line_str" };
+            Section debug_line          = { name: ".debug_line" };
         }
         else
         {
@@ -553,52 +573,140 @@ static if (1)
         /* DWARF 7.5.3: "Each declaration begins with an unsigned LEB128 number
          * representing the abbreviation code itself."
          */
-        uint abbrevcode = 1;
+        uint abbrevcode;
         AApair *abbrev_table;
-        int hasModname;    // 1 if has DW_TAG_module
+        bool hasModname;    // if has DW_TAG_module
 
         // .debug_info
-        AAchars *infoFileName_table;
-
         AApair *type_table;
         AApair *functype_table;  // not sure why this cannot be combined with type_table
         Outbuffer *functypebuf;
 
-        struct DebugInfoHeader
-        {
-          align (1):
-            uint total_length  = 0;
-            ushort version_    = 3;
-            uint abbrev_offset = 0;
-            ubyte address_size = 4;
-        }
-
-        // https://issues.dlang.org/show_bug.cgi?id=16563
-        static assert(DebugInfoHeader.alignof == 1 && DebugInfoHeader.sizeof == 11);
-
-        DebugInfoHeader debuginfo;
+        // debug_info's compilation unit offset
+        size_t CUoffset;
 
         // .debug_line
-        size_t linebuf_filetab_end;
+        uint filenamesCount;
+        AAchars* filenames_table;
+        Barray!ubyte line_number_prog;
+        const(char)[] primary_filename;
 
-        struct DebugLineHeader
-        {
-          align (1):
-            uint total_length                = 0;
-            ushort version_                  = 2;
-            uint prologue_length             = 0;
-            ubyte minimum_instruction_length = 1;
-            ubyte default_is_stmt            = true;
-            byte line_base                   = -5;
-            ubyte line_range                 = 14;
-            ubyte opcode_base                = 10;
-            ubyte[9] standard_opcode_lengths = [ 0,1,1,1,1,0,0,0,1 ];
-        }
-        static assert(DebugLineHeader.sizeof == 24);
-
-        DebugLineHeader debugline;
+        immutable byte line_base = -5;
+        immutable ubyte line_range = 14;
+        immutable ubyte opcode_base = 13;
 
         public uint[TYMAX] typidx_tab;
+
+        // .debug_names
+
+        // We need to store offsets because the final count/size will be rewritten.
+        size_t nCountOffset;
+        size_t nAbbrevSizeOffset;
+
+        size_t nCount;  // name_count
+
+
+        // TODO:
+        // 6.1.1.4.5 Hash Lookup Table
+        Barray!uint nBuckets;
+        Barray!uint nHashes;
+
+        AApair* nAbbrevTable;
+        uint nAbbrevCode;
+        Outbuffer* nAbbrevBuffer;
+
+        Barray!size_t nStringOffsets;
+        Barray!size_t nEntryOffsets;
+        Outbuffer* nIndexEntries;
+
+        // .debug_loclists
+
+        // List of Register Location Description
+        Barray!RegLocDesc loc_regdesc;
+
+        struct TargetAddress
+        {
+            IDXSEC seg;
+            size_t func_offset;
+        }
+
+        struct RegLocDesc
+        {
+            TargetAddress[2] addresses;
+            uint len;       // counted location description
+            ubyte op;       // location descriptions
+            int val;        // value of the OP code
+        }
+    }
+
+
+    /*****************************************
+     * Replace the bytes in `buf` from the `offset` by `data`.
+     *
+     * Params:
+     *      buf = buffer where `data` will be written
+     *      offset = offset of the bytes in `buf` to replace
+     *      data = bytes to write
+     */
+    extern(D) void rewrite32(Outbuffer* buf, uint offset, uint data)
+    {
+        ulong end = offset + data.sizeof;
+        for(uint i = 0; i < end - offset; ++i)
+            buf.buf[offset + i] = (data >> (8 * i)) & 0xff;
+    }
+
+    /// Ditto
+    extern(D) void rewrite64(Outbuffer* buf, uint offset, ulong data)
+    {
+        ulong end = offset + data.sizeof;
+        for(uint i = 0; i < end - offset; ++i)
+            buf.buf[offset + i] = (data >> (8 * i)) & 0xff;
+    }
+
+    void rewriteAddr(Outbuffer* buf, uint offset, size_t data)
+    {
+        if (I64)
+            rewrite64(buf, offset, data); // minus unit_length's length
+        else
+            rewrite32(buf, offset, cast(uint)data); // Ditto
+    }
+
+    /*****************************************
+     * Replace the `length` header in `buf`.
+     * `writeUnitLength` must be called first.
+     *
+     * Params:
+     *      buf = buffer where the `length` will be written
+     *      length = length to write
+     *
+     * See_Also:
+     *      writeUnitLength
+     */
+    void rewriteUnitLength(Outbuffer* buf, size_t length)
+    {
+        if (I64)
+            rewrite64(buf, 4, length - 12); // minus unit_length's length
+        else
+            rewrite32(buf, 0, cast(uint)length - 4); // Ditto
+    }
+
+    /*****************************************
+     * Append `length` to `buf` according to the DWARF v5 specification,
+     * chapter 7.2.2 Initial Length Values
+     *
+     * Params:
+     *      buf = buffer where the `length` will be written
+     *      length = length to write
+     * See_Also:
+     *      rewriteUnitLength
+     */
+    void writeUnitLength(Outbuffer* buf, size_t length = 0)
+    {
+        if (I64)
+            buf.write32(0xffffffff);    // initial length
+        else
+            assert(length < 0xfffffff0);
+        append_addr(buf, length);       // actual length
     }
 
     /*****************************************
@@ -608,47 +716,29 @@ static if (1)
      */
     void writeDebugFrameHeader(Outbuffer *buf)
     {
-        static struct DebugFrameHeader
-        {
-          align (1):
-            uint length;
-            uint CIE_id;
-            ubyte version_;
-            ubyte augmentation;
-            ubyte code_alignment_factor;
-            ubyte data_alignment_factor;
-            ubyte return_address_register;
-            ubyte[11] opcodes;
-        }
-        static assert(DebugFrameHeader.sizeof == 24);
+        writeUnitLength(buf, I64 ? 20 : 16);                        // unit length
+        append_addr(buf, I64 ? 0xffffffffffffffff : 0xffffffff);    // CIE id
+        buf.writeByte(4);                                           // version
+        buf.writeByte(0);                                           // augmentation
+        buf.writeByte(I64 ? 8 : 4);                                 // address size
+        buf.writeByte(0);                                           // segment selector size
+        buf.writeByte(1);                                           // code alignement factor
+        buf.writeByte(I64 ? 0x78 : 0x7c);                           // data alignement factor
+        buf.writeByte(I64 ? 16 : 8);                                // return address register
+        // TODO:
+        buf.writeByte(0);                                           // initial instructions
 
-        __gshared DebugFrameHeader debugFrameHeader =
-        {   16,             // length
-            0xFFFFFFFF,     // CIE_id
-            1,              // version_
-            0,              // augmentation
-            1,              // code alignment factor
-            0x7C,           // data alignment factor (-4)
-            8,              // return address register
-            [
-                DW_CFA_def_cfa, 4,4,    // r4,4 [r7,8]
-                DW_CFA_offset   +8,1,   // r8,1 [r16,1]
-                DW_CFA_nop, DW_CFA_nop,
-                DW_CFA_nop, DW_CFA_nop, // 64 padding
-                DW_CFA_nop, DW_CFA_nop, // 64 padding
-            ]
-        };
-        if (I64)
-        {   debugFrameHeader.length = 20;
-            debugFrameHeader.data_alignment_factor = 0x78;          // (-8)
-            debugFrameHeader.return_address_register = 16;
-            debugFrameHeader.opcodes[1] = 7;                        // RSP
-            debugFrameHeader.opcodes[2] = 8;
-            debugFrameHeader.opcodes[3] = DW_CFA_offset + 16;       // RIP
-        }
-        assert(debugFrameHeader.data_alignment_factor == 0x80 - OFFSET_FAC);
+        ubyte[11] padding =
+        [
+            DW_CFA_def_cfa,
+            I64 ? 7 : 4, I64 ? 8 : 4,           // r4,4 [r7, 8]
+            DW_CFA_offset + (I64 ? 16 : 8), 1,  // r8,1 [r16,1]
+            DW_CFA_nop, DW_CFA_nop,
+            DW_CFA_nop, DW_CFA_nop, // 64 padding
+            DW_CFA_nop, DW_CFA_nop, // 64 padding
+        ];
 
-        buf.writen(&debugFrameHeader,debugFrameHeader.length + 4);
+        buf.write(padding.ptr, padding.length);                      // padding
     }
 
     /*****************************************
@@ -1033,163 +1123,367 @@ static if (1)
             symbol_reset(s);
         resetSyms.reset();
 
-        /* ======================================== */
 
-        debug_str.initialize();
-        //Outbuffer *debug_str_buf = debug_str.buf;
-
-        /* ======================================== */
-
-        debug_ranges.initialize();
-
-        /* ======================================== */
-
-        debug_loc.initialize();
-
-        /* ======================================== */
-
-        if (infoFileName_table)
+        /* *********************************************************************
+         *                          String Table
+         ******************************************************************** */
         {
-            AAchars.destroy(infoFileName_table);
-            infoFileName_table = null;
+            debug_str.initialize();
         }
+        /* *********************************************************************
+         *                     7.26 Strings Offset Table
+         ******************************************************************** */
+        {
+            debug_str_offsets.initialize();
 
-        debug_line.initialize();
+            writeUnitLength(debug_str_offsets.buf, 0);  // unit length
+            debug_str_offsets.buf.write16(5);           // version
+            debug_str_offsets.buf.write16(0);           // padding
+        }
+        /* *********************************************************************
+         *                     7.27 Address Table
+         ******************************************************************** */
+        {
+            debug_addr.initialize();
 
-        debugline = DebugLineHeader.init;
+            writeUnitLength(debug_addr.buf, 0);     // unit length
+            debug_addr.buf.write16(5);              // version
+            debug_addr.buf.writeByte(I64 ? 8 : 4);  // address size
+            debug_addr.buf.writeByte(0);            // segment selector size
+        }
+        /* *********************************************************************
+         *                     7.28 Range List Tables
+         ******************************************************************** */
+        {
+            debug_rnglists.initialize();
 
-        debug_line.buf.write(&debugline, debugline.sizeof);
+            writeUnitLength(debug_rnglists.buf, 0);     // unit length
+            debug_rnglists.buf.write16(5);              // version
+            debug_rnglists.buf.writeByte(I64 ? 8 : 4);  // address_size
+            debug_rnglists.buf.writeByte(0);            // segment_selector_size
+            debug_rnglists.buf.write32(0);              // offset_entry_count
+        }
+        /* *********************************************************************
+         *                     7.29 Location List Table
+         ******************************************************************** */
+        {
+            debug_loclists.initialize();
 
-        // include_directories
-        version (SCPP)
-            for (size_t i = 0; i < pathlist.length(); ++i)
+            writeUnitLength(debug_loclists.buf, 0);     // unit length
+            debug_loclists.buf.write16(5);              // version
+            debug_loclists.buf.writeByte(I64 ? 8 : 4);  // address_size
+            debug_loclists.buf.writeByte(0);            // segment_selector_size
+        }
+        /* *********************************************************************
+         *                     6.2.4 The Line Number Program Header
+         ******************************************************************** */
+        {
+            if (filenames_table)
             {
-                debug_line.buf.writeString(pathlist[i]);
-                debug_line.buf.writeByte(0);
+                AAchars.destroy(filenames_table);
+                filenames_table = null;
+            }
+            primary_filename = filename;
+
+            debug_line.initialize();
+
+            writeUnitLength(debug_line.buf, 0);     // unit length
+            debug_line.buf.write16(5);              // version
+            debug_line.buf.writeByte(I64 ? 8 : 4);  // address_size
+            debug_line.buf.writeByte(0);            // segment_selector_size
+            append_addr(debug_line.buf, 0);         // header_length
+            debug_line.buf.writeByte(1);            // minimum_instruction_length
+            debug_line.buf.writeByte(1);            // maximum_operations_per_instruction
+            debug_line.buf.writeByte(true);         // default_is_stmt
+            debug_line.buf.writeByte(line_base);    // line_base
+            debug_line.buf.writeByte(line_range);   // line_range
+            debug_line.buf.writeByte(opcode_base);  // opcode_base
+
+            assert(opcode_base == 13);
+
+            // 6.2.5.2 Standard Opcodes
+            immutable ubyte[opcode_base - 1] sol =
+            [
+                0,      // DW_LNS_copy
+                1,      // DW_LNS_advance_pc
+                1,      // DW_LNS_advance_line
+                1,      // DW_LNS_set_file
+                1,      // DW_LNS_set_column
+                0,      // DW_LNS_negate_stmt
+                0,      // DW_LNS_set_basic_block
+                0,      // DW_LNS_const_add_pc
+                0,      // DW_LNS_fixed_advance_pc
+                0,      // DW_LNS_set_prologue_end
+                0,      // DW_LNS_set_epilogue_begin
+                0,      // DW_LNS_set_isa
+            ];
+            debug_line.buf.write(sol);              // standard_opcode_lengths
+
+            const ubyte[2] defmt =
+            [
+                DW_LNCT_path,   DW_FORM_string
+            ];
+            // number of pairs
+            debug_line.buf.writeByte(1);            // directory_entry_format_count
+            foreach(ubyte b; defmt)
+                debug_line.buf.writeuLEB128(b);     // directory_entry_format
+
+
+            version (SCPP)
+            {
+                debug_line.buf.writeuLEB128(pathlist.length());     // directories_count
+                foreach(path; pathlist)
+                {
+                    debug_line.buf.writeString(path);   // directories
+                    debug_line.buf.writeByte(0);
+                }
+            }
+            else version (MARS)
+            {
+                debug_line.buf.writeuLEB128(1);         // directories_count
+                debug_line.buf.writeString(cwd);        // directories
+            }
+            else version (none)
+            {
+                const len = global.params.imppath.dim;
+                debug_line.buf.writeuLEB128(len);       // directories_count
+                for (int i = 0; i < len; i++)
+                {
+                    debug_line.buf.writeString((*global.params.imppath)[i]);
+                }
+            }
+            else
+                assert(0);
+
+
+            const ubyte[8] fefmt =
+            [
+                DW_LNCT_path,               DW_FORM_string,
+                DW_LNCT_directory_index,    DW_FORM_udata,
+                DW_LNCT_timestamp,          DW_FORM_udata,
+                DW_LNCT_size,               DW_FORM_udata,
+            ];
+            // number of pairs
+            debug_line.buf.writeByte(fefmt.length / 2); // file_name_entry_format_count
+
+            foreach(ubyte b; fefmt)
+                debug_line.buf.writeuLEB128(b);     // file_name_entry_format
+
+            // file_names_count and file_names in dwarf_termfile
+        }
+        /* *********************************************************************
+         *                     6.3 Macro Information
+         ******************************************************************** */
+        {
+            debug_macro.initialize();
+
+            debug_macro.buf.write16(5);                 // version
+            ubyte flags = 0;
+
+            if (I64)
+                flags |= 1 << 0;                        // offset_size_flag
+
+            //flags |= 1 << 1;                        // debug_line_offset_flag is present
+            //flags |= 1 << 2;                        // opcode_operands_table_flag is present
+
+            debug_macro.buf.writeByte(flags);           // flags
+            //append_addr(debug_macro.buf, 0);        // debug_line_offset
+            //append_addr(debug_macro.buf, 0);        // opcode_operands_table
+
+            // DW_MACRO_define_strx
+            // DW_MACRO_undef_strx
+        }
+        /* *********************************************************************
+         *                     7.5.3 Abbreviations Tables
+         ******************************************************************** */
+        {
+            debug_abbrev.initialize();
+
+            // Free only if starting another file. Waste of time otherwise.
+            if (abbrev_table)
+            {
+                AApair.destroy(abbrev_table);
+                abbrev_table = null;
             }
 
-        version (MARS)
-        version (none)
-            for (int i = 0; i < global.params.imppath.dim; i++)
-            {
-                debug_line.buf.writeString((*global.params.imppath)[i]);
-                debug_line.buf.writeByte(0);
-            }
+            // Abbrev table of the compilation unit
+            // Chapter 3.1.1 Full and Partial Compilation Unit Entries
+            immutable ubyte[24] abbrevHeader =
+            [
+                DW_TAG_compile_unit,    DW_CHILDREN_yes,
+                //DW_AT_ranges,           DW_FORM_sec_offset,
+                DW_AT_low_pc,           DW_FORM_addr,
+                DW_AT_name,             DW_FORM_string,
+                DW_AT_language,         DW_FORM_data1,
+                //DW_AT_stmt_list,        DW_FORM_sec_offset,
+                //DW_AT_macros,           DW_FORM_sec_offset,
+                DW_AT_comp_dir,         DW_FORM_string,
+                DW_AT_producer,         DW_FORM_string,
+                DW_AT_identifier_case,  DW_FORM_data1,
+                //DW_AT_base_types,       DW_FORM_ref_sup8,   // TODO: sup4 or sup8 ? I64 ?
+                DW_AT_use_UTF8,         DW_FORM_flag,
+                DW_AT_main_subprogram,  DW_FORM_flag,
+                DW_AT_entry_pc,         DW_FORM_addr,
+                //DW_AT_str_offsets_base, DW_FORM_sec_offset, // TODO: DW_FORM_strx ?
+                //DW_AT_addr_base,        DW_FORM_sec_offset, // TODO: DW_FORM_addrx ?
+                //DW_AT_rnglists_base,    DW_FORM_sec_offset, // TODO: DW_FORM_rnglistx ?
+                DW_AT_loclists_base,    DW_FORM_loclistx,
+                0,                      0,
+            ];
 
-        debug_line.buf.writeByte(0);              // terminated with 0 byte
-
-        /* ======================================== */
-
-        debug_abbrev.initialize();
-        abbrevcode = 1;
-
-        // Free only if starting another file. Waste of time otherwise.
-        if (abbrev_table)
-        {
-            AApair.destroy(abbrev_table);
-            abbrev_table = null;
+            abbrevcode = 0;
+            dwarf_abbrev_code(abbrevHeader);
         }
-
-        static immutable ubyte[21] abbrevHeader =
-        [
-            1,                      // abbreviation code
-            DW_TAG_compile_unit,
-            1,
-            DW_AT_producer,  DW_FORM_string,
-            DW_AT_language,  DW_FORM_data1,
-            DW_AT_name,      DW_FORM_string,
-            DW_AT_comp_dir,  DW_FORM_string,
-            DW_AT_low_pc,    DW_FORM_addr,
-            DW_AT_entry_pc,  DW_FORM_addr,
-            DW_AT_ranges,    DW_FORM_data4,
-            DW_AT_stmt_list, DW_FORM_data4,
-            0,               0,
-        ];
-
-        debug_abbrev.buf.write(abbrevHeader.ptr,abbrevHeader.sizeof);
-
-        /* ======================================== */
-
-        debug_info.initialize();
-
-        debuginfo = DebugInfoHeader.init;
-        if (I64)
-            debuginfo.address_size = 8;
-
-        // https://issues.dlang.org/show_bug.cgi?id=16563
-        assert(debuginfo.alignof == 1);
-        debug_info.buf.write(&debuginfo, debuginfo.sizeof);
-
-        static if (ELFOBJ)
-            dwarf_addrel(debug_info.seg,6,debug_abbrev.seg);
-
-        debug_info.buf.writeuLEB128(1);                   // abbreviation code
-
-        version (MARS)
+        /* *********************************************************************
+         *             7.5.1.1 Full and Partial Compilation Unit Headers
+         ******************************************************************** */
         {
-            debug_info.buf.write("Digital Mars D ");
-            debug_info.buf.writeString(config._version);     // DW_AT_producer
+            debug_info.initialize();
+
+            /* ================== Compilation Unit Header =================== */
+
+            writeUnitLength(debug_info.buf, 0);         // unit length
+            debug_info.buf.write16(5);                  // version
+            debug_info.buf.writeByte(DW_UT_compile);    // Unit Type
+            debug_info.buf.writeByte(I64 ? 8 : 4);      // Address size
+            append_addr(debug_info.buf, 0);             // debug abbrev offset
+
+            /* ================ END Compilation Unit Header ================= */
+
+            CUoffset = debug_info.buf.length;
+
+            /* ====================== Compilation Unit ====================== */
+
+            //static if (ELFOBJ)
+            //    dwarf_addrel(debug_info.seg, 6, debug_abbrev.seg); // TODO: Why 6 ?
+            assert(abbrevcode == 1);
+            debug_info.buf.writeuLEB128(abbrevcode);            // abbreviation code
+
+            // TODO: set to the offset in rnglists
+            /*
+             * whose values encode the contiguous or non-contiguous address
+             * ranges, respectively, of the machine instructions generated for
+             * the compilation unit
+             */
+            // TODO: specify the default base address for use in loclists and rnglists
+            // TODO: chap3.1.1
+            //append_addr(debug_info.buf, 0);                     // DW_AT_ranges
+
+            append_addr(debug_info.buf, 0);                     // DW_AT_low_pc
+            debug_info.buf.writeString(filename);               // DW_AT_name
+
             // DW_AT_language
-            debug_info.buf.writeByte((config.fulltypes == CVDWARF_D) ? DW_LANG_D : DW_LANG_C89);
+            version(MARS)
+                debug_info.buf.writeByte((config.fulltypes == CVDWARF_D) ? DW_LANG_D : DW_LANG_C89);
+            else version(SCPP)
+                debug_info.buf.writeByte(DW_LANG_C89);
+            else
+                static assert(0);
+
+            // TODO:
+            //static if (ELFOBJ)
+            //    dwarf_addrel(debug_info.seg, debug_info.buf.length(), debug_line.seg);
+
+            // TODO: data4 -> offset (x2)
+            //append_addr(debug_info.buf, 0);                   // DW_AT_stmt_list
+            //append_addr(debug_info.buf, 0);                   // DW_AT_macros
+
+            char* cwd = getcwd(null, 0);
+            debug_info.buf.writeString(cwd);                    // DW_AT_comp_dir as DW_FORM_string
+            free(cwd);
+
+            // DW_AT_producer
+            version (MARS)
+            {
+                debug_info.buf.write("Digital Mars D ");
+                debug_info.buf.write(config._version);
+            }
+            else version (SCPP)
+            {
+                debug_info.buf.write("Digital Mars C ");
+                debug_info.buf.writeString(global._version);
+            }
+            else
+                static assert(0);
+
+            debug_info.buf.writeByte(DW_ID_case_sensitive);     // DW_AT_identifier_case
+
+            // TODO:
+            // DW_AT_base_types
+
+            debug_info.buf.writeByte(1);                        // DW_AT_use_UTF8
+            // TODO: set to 1 if file contains the main function
+            debug_info.buf.writeByte(0);                        // DW_AT_main_subprogram
+            append_addr(debug_info.buf, 0);                     // DW_AT_entry_pc
+
+            // TODO: data4 -> offset (x4)
+            //append_addr(debug_info.buf, 0);                   // DW_AT_str_offsets_base
+            //append_addr(debug_info.buf, 0);                   // DW_AT_addr_base
+            //append_addr(debug_info.buf, 0);                   // DW_AT_rnglists_base
+
+            static if (ELFOBJ)
+                dwarf_addrel(debug_info.seg, debug_info.buf.length(), debug_loclists.seg);
+
+            // The DW_AT_loclists_base attribute points to the first offset following the header.
+            // + 4 because of offset_entry_count
+            append_addr(debug_info.buf, debug_loclists.buf.length + 4);   // DW_AT_loclists_base
+
+            memset(typidx_tab.ptr, 0, typidx_tab.sizeof);
+
+            /* ==================== END Compilation Unit ==================== */
         }
-        else version (SCPP)
+        /* *********************************************************************
+         *                     6.1.1 Lookup by Name
+         ******************************************************************** */
         {
-            debug_info.buf.write("Digital Mars C ");
-            debug_info.buf.writeString(global._version);      // DW_AT_producer
-            debug_info.buf.writeByte(DW_LANG_C89);            // DW_AT_language
+            debug_names.initialize();
+            //int seg = debug_names.seg;
+
+            writeUnitLength(debug_names.buf, 0);    // unit length
+            debug_names.buf.write16(5);             // version
+            debug_names.buf.write16(0);             // padding
+            debug_names.buf.write32(1);             // comp_unit_count
+            debug_names.buf.write32(0);             // local_type_unit_count
+            debug_names.buf.write32(0);             // foreign_type_unit_count
+            debug_names.buf.write32(0);             // bucket_count
+
+            nCountOffset = debug_names.buf.length;
+            debug_names.buf.write32(0);             // name_count
+
+            nAbbrevSizeOffset = debug_names.buf.length;
+            debug_names.buf.write32(0);             // abbrev_table_size
+            debug_names.buf.write32(0);             // augmentation_string_size
+            // no augmentation_string
+
+            // TODO: check CUoffset is from debug info
+            //static if (ELFOBJ)
+            //    dwarf_addrel(debug_names.seg, CUoffset, debug_info.seg);
+            append_addr(debug_names.buf, CUoffset); // CUs list (total: 1)
+            // no TUs list
+
+            alloc_buf(nAbbrevBuffer);
+            alloc_buf(nIndexEntries);
+            // TODO: delete_buf ?
+
         }
-        else
-            static assert(0);
+        /* *********************************************************************
+         *                     7.21 Address Range Table
+         *                     6.1.2 Lookup by Address
+         ******************************************************************** */
+        {
+            debug_aranges.initialize();
 
-        debug_info.buf.writeString(filename);             // DW_AT_name
+            writeUnitLength(debug_aranges.buf, 0);      // unit length
+            debug_aranges.buf.write16(2);               // version
 
-        char* cwd = getcwd(null, 0);
-        debug_info.buf.writeString(cwd);                  // DW_AT_comp_dir as DW_FORM_string
-        free(cwd);
+            static if (ELFOBJ)
+                dwarf_addrel(debug_aranges.seg, debug_aranges.buf.length(), debug_info.seg);
 
-        append_addr(debug_info.buf, 0);               // DW_AT_low_pc
-        append_addr(debug_info.buf, 0);               // DW_AT_entry_pc
-
-        static if (ELFOBJ)
-            dwarf_addrel(debug_info.seg,debug_info.buf.length(),debug_ranges.seg);
-
-        debug_info.buf.write32(0);                        // DW_AT_ranges
-
-        static if (ELFOBJ)
-            dwarf_addrel(debug_info.seg,debug_info.buf.length(),debug_line.seg);
-
-        debug_info.buf.write32(0);                        // DW_AT_stmt_list
-
-        memset(typidx_tab.ptr, 0, typidx_tab.sizeof);
-
-        /* ======================================== */
-
-        debug_pubnames.initialize();
-        int seg = debug_pubnames.seg;
-
-        debug_pubnames.buf.write32(0);             // unit_length
-        debug_pubnames.buf.write16(2);           // version_
-
-        static if (ELFOBJ)
-            dwarf_addrel(seg,debug_pubnames.buf.length(),debug_info.seg);
-
-        debug_pubnames.buf.write32(0);             // debug_info_offset
-        debug_pubnames.buf.write32(0);             // debug_info_length
-
-        /* ======================================== */
-
-        debug_aranges.initialize();
-
-        debug_aranges.buf.write32(0);              // unit_length
-        debug_aranges.buf.write16(2);            // version_
-
-        static if (ELFOBJ)
-            dwarf_addrel(debug_aranges.seg,debug_aranges.buf.length(),debug_info.seg);
-
-        debug_aranges.buf.write32(0);              // debug_info_offset
-        debug_aranges.buf.writeByte(I64 ? 8 : 4);  // address_size
-        debug_aranges.buf.writeByte(0);            // segment_size
-        debug_aranges.buf.write32(0);              // pad to 16
+            debug_aranges.buf.write32(0);              // debug_info_offset
+            debug_aranges.buf.writeByte(I64 ? 8 : 4);  // address_size
+            debug_aranges.buf.writeByte(0);            // segment_size
+            debug_aranges.buf.write32(0);              // pad to 16
+        }
     }
 
 
@@ -1204,24 +1498,12 @@ static if (1)
     /// Ditto
     extern(D) int dwarf_line_addfile(const(char)[] filename)
     {
-        if (!infoFileName_table)
-        {
-            infoFileName_table = AAchars.create();
-            linebuf_filetab_end = debug_line.buf.length();
-        }
+        if (!filenames_table)
+            filenames_table = AAchars.create();
 
-        uint *pidx = infoFileName_table.get(filename);
+        uint* pidx = filenames_table.get(filename);
         if (!*pidx)                 // if no idx assigned yet
-        {
-            *pidx = infoFileName_table.length(); // assign newly computed idx
-
-            size_t before = debug_line.buf.length();
-            debug_line.buf.writeString(filename);
-            debug_line.buf.writeByte(0);      // directory table index
-            debug_line.buf.writeByte(0);      // mtime
-            debug_line.buf.writeByte(0);      // length
-            linebuf_filetab_end += debug_line.buf.length() - before;
-        }
+            *pidx = filenames_table.length(); // assign newly computed idx
 
         return *pidx;
     }
@@ -1242,11 +1524,11 @@ static if (1)
                 DW_AT_name,    DW_FORM_string, // module name
                 0,             0,
             ];
-            abbrevcode++;
-            debug_abbrev.buf.writeuLEB128(abbrevcode);
-            debug_abbrev.buf.write(abbrevModule.ptr, abbrevModule.sizeof);
-            debug_info.buf.writeuLEB128(abbrevcode);      // abbreviation code
-            debug_info.buf.writeString(modname);          // DW_AT_name
+
+            uint code = dwarf_abbrev_code(abbrevModule);
+
+            debug_info.buf.writeuLEB128(code);      // abbreviation code
+            debug_info.buf.writeString(modname);    // DW_AT_name
             //hasModname = 1;
         }
         else
@@ -1268,10 +1550,37 @@ static if (1)
     {
         //printf("dwarf_termfile()\n");
 
-        /* ======================================== */
+        /* ========================== debug_line ============================ */
+
+        debug_line.buf.writeuLEB128(filenames_table.length());          // file_names_count
+
+        /*
+         * 6.2.4, The Line Number Program Header, "20. filenames", p157 :
+         *
+         * The first entry in the sequence is the primary source file whose file
+         * name exactly matches that given in the DW_AT_name attribute in the
+         * compilation unit debugging information entry.
+         */
+        debug_line.buf.writeString(primary_filename);   // DW_LNCT_path
+        debug_line.buf.writeuLEB128(0);                 // DW_LNCT_directory_index
+        debug_line.buf.writeuLEB128(0);                 // DW_LNCT_timestamp
+        debug_line.buf.writeuLEB128(0);                 // DW_LNCT_size
+
+        // TODO: set DW_LNCT_size to the size of the file in bytes
+        foreach (const(char)[] f; filenames_table.aa.keys())    // file_names
+        {
+            if (f == primary_filename)
+                continue;
+
+            debug_line.buf.writeString(f);          // DW_LNCT_path
+            debug_line.buf.writeuLEB128(0);         // DW_LNCT_directory_index
+            debug_line.buf.writeuLEB128(0);         // DW_LNCT_timestamp
+            debug_line.buf.writeuLEB128(0);         // DW_LNCT_size
+        }
+
 
         // Put out line number info
-
+/+
         // file_names
         uint last_filenumber = 0;
         const(char)* last_filename = null;
@@ -1306,11 +1615,7 @@ static if (1)
                 }
             }
         }
-        // assert we haven't emitted anything but file table entries
-        assert(debug_line.buf.length() == linebuf_filetab_end);
-        debug_line.buf.writeByte(0);              // end of file_names
-
-        debugline.prologue_length = cast(uint)debug_line.buf.length() - 10;
++/
 
         for (uint seg = 1; seg < SegData.length; seg++)
         {
@@ -1321,31 +1626,50 @@ static if (1)
             if (!sd.SDlinnum_data.length)
                 continue;
 
+            // TODO: assert ?
             static if (ELFOBJ)
                 if (!sd.SDsym) // gdb ignores line number data without a DW_AT_name
                     continue;
 
-            //printf("sd = %x, SDlinnum_count = %d\n", sd, sd.SDlinnum_count);
+            //printf("sd = %p, SDlinnum_count = %lld\n", sd, sd.SDlinnum_data.length);
             for (int i = 0; i < sd.SDlinnum_data.length; i++)
-            {   linnum_data *ld = &sd.SDlinnum_data[i];
+            {
+                linnum_data *ld = &sd.SDlinnum_data[i];
 
                 // Set address to start of segment with DW_LNE_set_address
                 debug_line.buf.writeByte(0);
                 debug_line.buf.writeByte(_tysize[TYnptr] + 1);
                 debug_line.buf.writeByte(DW_LNE_set_address);
 
-                dwarf_appreladdr(debug_line.seg,debug_line.buf,seg,0);
+                dwarf_appreladdr(debug_line.seg, debug_line.buf, seg, 0);
 
-                // Dwarf2 6.2.2 State machine registers
-                uint address = 0;       // instruction address
+                /* *************************************************************
+                 *             6.2 Line Number Information
+                 ************************************************************ */
+
+                /* ============= 6.2.2 State Machine Registers ============== */
+                uint address = 0;           // instruction address
+                uint opindex = 0;           // non-VLIW arch: always 0.
                 uint file = ld.filenumber;
-                uint line = 1;          // line numbers beginning with 1
+                uint line = 1;              // line numbers beginning with 1
+                uint column = 1;
+                bool is_stmt;               // = default_is_stmt                // TODO
+                bool basic_block;           // Begining of a basic block        // TODO
+                bool end_sequence;          // end of func                      // TODO
+                bool prologue_end;          // breakpoint ?                     // TODO
+                bool epilogue_begin;        // breakpoint prior exit ?          // TODO
+                uint isa = 0;
+                uint discriminator = 0;
 
                 debug_line.buf.writeByte(DW_LNS_set_file);
                 debug_line.buf.writeuLEB128(file);
 
                 for (int j = 0; j < ld.linoff.length; j++)
-                {   int lininc = ld.linoff[j].lineNumber - line;
+                {
+                    // desired line increment
+                    int lininc = ld.linoff[j].lineNumber - line;
+                    // operation advance
+                    // address increment
                     int addinc = ld.linoff[j].offset - address;
 
                     //printf("\tld[%d] line = %d offset = x%x lininc = %d addinc = %d\n", j, ld.linoff[j].lineNumber, ld.linoff[j].offset, lininc, addinc);
@@ -1353,26 +1677,34 @@ static if (1)
                     //assert(addinc >= 0);
                     if (addinc < 0)
                         continue;
+
                     if (j && lininc == 0 && !(addinc && j + 1 == ld.linoff.length))
                         continue;
+
                     line += lininc;
                     if (line < linestart)
                         linestart = line;
+
                     address += addinc;
                     if (address >= addressmax)
                         addressmax = address + 1;
-                    if (lininc >= debugline.line_base && lininc < debugline.line_base + debugline.line_range)
+
+                    if (lininc >= line_base && lininc < line_base + line_range)
                     {
-                        uint opcode = lininc - debugline.line_base +
-                            debugline.line_range * addinc +
-                            debugline.opcode_base;
+                        uint opcode = (lininc - line_base)
+                            + (line_range * addinc)
+                            + opcode_base;
 
                         if (opcode <= 255)
                         {
+                            assert(opcode > opcode_base);
+                            // special opcode
                             debug_line.buf.writeByte(opcode);
                             continue;
                         }
                     }
+
+
                     if (lininc)
                     {
                         debug_line.buf.writeByte(DW_LNS_advance_line);
@@ -1401,51 +1733,173 @@ static if (1)
             }
         }
 
-        debugline.total_length = cast(uint)debug_line.buf.length() - 4;
-        memcpy(debug_line.buf.buf, &debugline, debugline.sizeof);
-
+        // TODO:
         // Bugzilla 3502, workaround OSX's ld64-77 bug.
         // Don't emit the the debug_line section if nothing has been written to the line table.
-        if (debugline.prologue_length + 10 == debugline.total_length + 4)
-            debug_line.buf.reset();
 
-        /* ================================================= */
+        rewriteUnitLength(debug_line.buf, debug_line.buf.length);
 
-        debug_abbrev.buf.writeByte(0);
+        /* ========================= debug_abbrev =========================== */
 
-        /* ================================================= */
+        debug_abbrev.buf.writeByte(0);  // ending abbreviation code
 
-        debug_info.buf.writeByte(0);      // ending abbreviation code
+        /* ========================== debug_info ============================ */
 
-        debuginfo.total_length = cast(uint)debug_info.buf.length() - 4;
+        debug_info.buf.writeByte(0);    // ending abbreviation code
 
-        // https://issues.dlang.org/show_bug.cgi?id=16563
-        assert(debuginfo.alignof == 1);
-        memcpy(debug_info.buf.buf, &debuginfo, debuginfo.sizeof);
+        rewriteUnitLength(debug_info.buf, debug_info.buf.length());
 
-        /* ================================================= */
+        /* *********************************************************************
+         *                     6.1.1 Lookup by Name
+         ******************************************************************** */
+        {
+            // TODO:
+            // Write buckets
+            // write hashes
 
-        // Terminate by offset field containing 0
-        debug_pubnames.buf.write32(0);
+            // 6.1.1.1
+            // 2.17 Code Addresses, Ranges and Base
+    /+
 
-        // Plug final sizes into header
-        *cast(uint *)debug_pubnames.buf.buf = cast(uint)debug_pubnames.buf.length() - 4;
-        *cast(uint *)(debug_pubnames.buf.buf + 10) = cast(uint)debug_info.buf.length();
 
-        /* ================================================= */
+            ubyte[8] abbrev_variable =
+            [
+                DW_TAG_variable,
+                DW_AT_name,     DW_FORM_string,
+                DW_AT_location, DW_FORM_loclists_x, // offset in debug_loclists
+                DW_IDX_parent,  DW_FORM_data8,
+                0,
+            ];
+            dwarf_names_abbrev_code(abbrev_variable);
+    +/
+            debug_names.buf.write(nStringOffsets);
+            //append_addr(debug_names.buf, 0);    // Last string offset
 
-        // Terminate by address/length fields containing 0
-        append_addr(debug_aranges.buf, 0);
-        append_addr(debug_aranges.buf, 0);
+            debug_names.buf.write(nEntryOffsets);
+            //append_addr(debug_names.buf, 0);    // Last entry offset
 
-        // Plug final sizes into header
-        *cast(uint *)debug_aranges.buf.buf = cast(uint)debug_aranges.buf.length() - 4;
+            nAbbrevBuffer.writeByte(0);         // Last abbrev code
+            debug_names.buf.write(nAbbrevBuffer.buf, nAbbrevBuffer.length);
+            //debug_names.buf.writeByte(0);
+            nIndexEntries.writeByte(0); // Terminating entry whose abbreviation code is 0.
+            debug_names.buf.write(nIndexEntries.buf, nIndexEntries.length);
 
-        /* ================================================= */
+            // Terminate by offset field containing 0
+            debug_names.buf.write32(0);
 
-        // Terminate by beg address/end address fields containing 0
-        append_addr(debug_ranges.buf, 0);
-        append_addr(debug_ranges.buf, 0);
+            // Plug final sizes into header
+            printf("abbrevtable: size: %lld, len: %lld, code: %d\n", nAbbrevBuffer.sizeof, nAbbrevBuffer.length, nAbbrevCode);
+            printf("entry offsets: size:%lld, len: %lld, code: %lld\n", nEntryOffsets.sizeof, nEntryOffsets.length, nCount);
+
+            assert(nEntryOffsets.length == nCount);
+            assert(nStringOffsets.length == nCount);
+
+            rewrite32(debug_names.buf, cast(uint) nAbbrevSizeOffset,
+                cast(uint) nAbbrevBuffer.length);                                 // abbrev_table_size
+
+            rewrite32(debug_names.buf, cast(uint) nCountOffset, cast(uint) nCount); // name_count
+
+            rewriteUnitLength(debug_names.buf, debug_names.buf.length());
+
+
+
+            //printf("names length: %lld\n", debug_names.buf.length);
+            //printOutbuffer(debug_names.buf, "debug_names");
+        }
+        /* *********************************************************************
+         *                     6.1.2 Lookup by Address
+         ******************************************************************** */
+        {
+            // Terminate by address/length fields containing 0
+            append_addr(debug_aranges.buf, 0);
+            //append_addr(debug_aranges.buf, 0);
+
+            // Plug final sizes into header
+            rewriteUnitLength(debug_aranges.buf, debug_aranges.buf.length);
+        }
+        /* *********************************************************************
+         *                     7.29 Location List Table
+         ******************************************************************** */
+        {
+            // TODO:
+            /*
+
+    EXCEPTED ?:
+
+0x0000023c:
+            [0x000000000009693c, 0x000000000009693d): DW_OP_breg7 RSP+8
+            [0x000000000009693d, 0x000000000009693f): DW_OP_breg7 RSP+16
+            [0x000000000009693f, 0x0000000000096963): DW_OP_breg6 RBP+16
+0x00000250:
+            [0x0000000000096964, 0x0000000000096965): DW_OP_breg7 RSP+8
+            [0x0000000000096965, 0x0000000000096967): DW_OP_breg7 RSP+16
+            [0x0000000000096967, 0x0000000000096979): DW_OP_breg6 RBP+16
+0xYYYYY...
+
+    ACTUAL:
+
+
+0x0000023c:
+            [0x000000000009693c, 0x000000000009693d): DW_OP_breg7 RSP+8
+            [0x000000000009693d, 0x000000000009693f): DW_OP_breg7 RSP+16
+            [0x000000000009693f, 0x0000000000096963): DW_OP_breg6 RBP+16
+            [0x0000000000096964, 0x0000000000096965): DW_OP_breg7 RSP+8
+            [0x0000000000096965, 0x0000000000096967): DW_OP_breg7 RSP+16
+            [0x0000000000096967, 0x0000000000096979): DW_OP_breg6 RBP+16
+
+            */
+            debug_loclists.buf.write32(cast(uint)loc_regdesc.length);  // offset_entry_count (header)
+
+            // Offset of the begining of the offsets list
+            uint off = cast(uint)debug_loclists.buf.length;
+
+            // Write fake offsets
+            foreach (RegLocDesc rld; loc_regdesc)
+                 append_addr(debug_loclists.buf, 0);
+
+            foreach (RegLocDesc rld; loc_regdesc)
+            {
+                /* The contents of the i th offset is the offset from the
+                 * beginning of the offset array to the location of the i th
+                 * location list.
+                 */
+                rewriteAddr(debug_loclists.buf, off, debug_loclists.buf.length);
+
+                debug_loclists.buf.writeByte(DW_LLE_start_end);
+
+                foreach (taddr; rld.addresses)
+                    dwarf_appreladdr(debug_loclists.seg, debug_loclists.buf, taddr.seg, taddr.func_offset);
+
+                debug_loclists.buf.writeuLEB128(rld.len);
+                debug_loclists.buf.writeByte(rld.op);
+                debug_loclists.buf.writesLEB128(rld.val);
+
+                // Move to the next offset's offset
+                off += I64 ? 8 : 4;
+            }
+
+            debug_loclists.buf.writeByte(DW_LLE_end_of_list);
+            rewriteUnitLength(debug_loclists.buf, debug_loclists.buf.length);
+        }
+        /* *********************************************************************
+         *                     7.28 Range List Table
+         ******************************************************************** */
+        {
+            // TODO
+            // Terminate by beg address/end address fields containing 0
+            //append_addr(debug_rnglists.buf, 0);
+            //append_addr(debug_rnglists.buf, 0);
+
+            rewriteUnitLength(debug_rnglists.buf, debug_rnglists.buf.length);
+
+        }
+
+        /* *********************************************************************
+         *                     7.27 Address Table
+         ******************************************************************** */
+        {
+            rewriteUnitLength(debug_addr.buf, debug_addr.buf.length);
+        }
 
         /* ================================================= */
 
@@ -1637,7 +2091,6 @@ static if (1)
         uint idxsibling = 0;
         uint siblingoffset;
 
-        uint infobuf_offset = cast(uint)debug_info.buf.length();
         debug_info.buf.writeuLEB128(funcabbrevcode);  // abbreviation code
         if (haveparameters)
         {
@@ -1648,7 +2101,15 @@ static if (1)
         const(char)* name = getSymName(sfunc);
 
         debug_info.buf.writeString(name);             // DW_AT_name
-        debug_info.buf.writeString(sfunc.Sident.ptr);    // DW_AT_MIPS_linkage_name
+        /*
+         * TODO:
+         *
+         * 6.1.1.1:
+         * If a subprogram or inlined subroutine is included, and has a
+         * DW_AT_linkage_name attribute, there will be an additional index entry for
+         * the linkage name.
+         */
+        debug_info.buf.writeString(sfunc.Sident.ptr);    // DW_AT_linkage_name
         debug_info.buf.writeByte(filenum);            // DW_AT_decl_file
         debug_info.buf.write16(sfunc.Sfunc.Fstartline.Slinnum);   // DW_AT_decl_line
         if (ret_type)
@@ -1666,10 +2127,10 @@ static if (1)
 
         // DW_AT_frame_base
         static if (ELFOBJ)
-            dwarf_apprel32(debug_info.seg, debug_info.buf, debug_loc.seg, debug_loc.buf.length());
+            dwarf_apprel32(debug_info.seg, debug_info.buf, debug_loclists.seg, debug_loclists.buf.length());
         else
             // 64-bit DWARF relocations don't work for OSX64 codegen
-            debug_info.buf.write32(cast(uint)debug_loc.buf.length());
+            debug_info.buf.write32(cast(uint)debug_loclists.buf.length());
 
         if (haveparameters)
         {
@@ -1732,8 +2193,8 @@ static if (1)
                             }
                         L2:
                             targ_size_t closptr_off = sa.Sscope.Soffset; // __closptr offset
-                            //printf("dwarf closure: sym: %s, closptr: %s, ptr_off: %lli, memb_off: %lli\n",
-                            //    sa.Sident.ptr, sa.Sscope.Sident.ptr, closptr_off, memb_off);
+                            printf("dwarf closure: sym: %s, closptr: %s, ptr_off: %lli, memb_off: %lli\n",
+                                sa.Sident.ptr, sa.Sscope.Sident.ptr, closptr_off, memb_off);
 
                             debug_info.buf.writeByte(DW_OP_fbreg);
                             debug_info.buf.writesLEB128(cast(uint)(Auto.size + BPoff - Para.size + closptr_off)); // closure pointer offset from frame base
@@ -1767,66 +2228,135 @@ static if (1)
             *cast(uint *)(debug_info.buf.buf + siblingoffset) = idxsibling;
         }
 
-        /* ============= debug_pubnames =========================== */
-
-        debug_pubnames.buf.write32(infobuf_offset);
-        debug_pubnames.buf.writeString(name);
-
-        /* ============= debug_aranges =========================== */
-
-        if (sd.SDaranges_offset)
-            // Extend existing entry size
-            *cast(ulong *)(debug_aranges.buf.buf + sd.SDaranges_offset + _tysize[TYnptr]) = funcoffset + sfunc.Ssize;
-        else
-        {   // Add entry
-            sd.SDaranges_offset = cast(uint)debug_aranges.buf.length();
-            // address of start of .text segment
-            dwarf_appreladdr(debug_aranges.seg, debug_aranges.buf, seg, 0);
-            // size of .text segment
-            append_addr(debug_aranges.buf, funcoffset + sfunc.Ssize);
+        /* ========================= debug_aranges ========================== */
+        {
+            if (sd.SDaranges_offset)
+                // Extend existing entry size
+                *cast(ulong *)(debug_aranges.buf.buf + sd.SDaranges_offset + _tysize[TYnptr]) = funcoffset + sfunc.Ssize;
+            else
+            {   // Add entry
+                sd.SDaranges_offset = cast(uint)debug_aranges.buf.length();
+                // address of start of .text segment
+                dwarf_appreladdr(debug_aranges.seg, debug_aranges.buf, seg, 0);
+                // size of .text segment
+                append_addr(debug_aranges.buf, funcoffset + sfunc.Ssize);
+            }
         }
+        /* *********************************************************************
+         *                     6.1.1 Lookup by Name
+         ******************************************************************** */
+        {
+            // TODO
+            ubyte[5] names_abbrev_subprogram =
+            [
+                DW_TAG_subprogram,
+                DW_IDX_parent,  DW_FORM_data4,
+                DW_AT_name,     DW_FORM_string,
+                DW_AT_low_pc,   DW_FORM_addr,
+                0,              0,
+            ];
+            uint name_code = dwarf_names_abbrev_code(names_abbrev_subprogram);
+            uint offset = cast(uint) nIndexEntries.length;
+            printf("code: %d", name_code);
+            nIndexEntries.writeuLEB128(name_code);      // abbrev code
+            //nIndexEntries.writeString(name);            // DW_AT_name
+            //nIndexEntries.write64(cast(ulong) sfunc);   // DW_AT_low_pc
+            nIndexEntries.write32(cast(uint) sfunc);                   // DW_IDX_parent
+            nIndexEntries.write32(0);                 // end of entries for "a"
 
-        /* ============= debug_ranges =========================== */
+
+            nEntryOffsets.push(offset);
+            // Should be the fully qualified name, not the simple DW_AT_name
+            nStringOffsets.push(dwarf_str_add(name));
+
+            nCount++;
+
+
+            // TODO: buckets
+            // 6.1.1.4.5 pseudo code:
+            //uint hash = dwarf_hash();
+            //bucket = hash % buket_count;
+            // TODO: hashes
+
+            //add_s
+            // write entry offsets
+
+            // The abbreviations table describes the formats of the entries in the entry pool.
+
+            // index entries
+        }
+        /* ========================= debug_rnglists ========================= */
 
         /* Each function gets written into its own segment,
          * indicate this by adding to the debug_ranges
          */
         // start of function and end of function
-        dwarf_appreladdr(debug_ranges.seg, debug_ranges.buf, seg, funcoffset);
-        dwarf_appreladdr(debug_ranges.seg, debug_ranges.buf, seg, funcoffset + sfunc.Ssize);
+        //dwarf_appreladdr(debug_ranges.seg, debug_ranges.buf, seg, funcoffset);
+        //dwarf_appreladdr(debug_ranges.seg, debug_ranges.buf, seg, funcoffset + sfunc.Ssize);
+        // TODO
 
-        /* ============= debug_loc =========================== */
+        /* *********************************************************************
+         *                     7.29 Location List Table
+         *                     2.6.2 Location Lists
+         ******************************************************************** */
+        {
+            assert(Para.size >= 2 * REGSIZE);
+            //assert(Para.size < 63); // avoid sLEB128 encoding
+            const ushort op_size = 0x0002;
+            ubyte op;
+            int val;
+            uint len;
 
-        assert(Para.size >= 2 * REGSIZE);
-        assert(Para.size < 63); // avoid sLEB128 encoding
-        ushort op_size = 0x0002;
-        ushort loc_op;
+            void write_regdesc(ubyte op, int val, TargetAddress[2] addresses)
+            {
+                assert(op >= DW_OP_breg0 && op <= DW_OP_breg31);
+                uint len = cast(uint)(op.sizeof + sLEB128size(val));
 
-        // set the entry for this function in .debug_loc segment
-        // after call
-        dwarf_appreladdr(debug_loc.seg, debug_loc.buf, seg, funcoffset + 0);
-        dwarf_appreladdr(debug_loc.seg, debug_loc.buf, seg, funcoffset + 1);
+                RegLocDesc rld =
+                {
+                    addresses,  // Addresses to relocate
+                    len,        // length of the location decription
+                    op,         // location decription (DW_OP_breg0 .. 31)
+                    val,        // offset from the contents of the specified register
+                };
 
-        loc_op = cast(ushort)(((Para.size - REGSIZE) << 8) | (DW_OP_breg0 + dwarf_regno(SP)));
-        debug_loc.buf.write32(loc_op << 16 | op_size);
+                loc_regdesc.push(rld);
+            }
 
-        // after push EBP
-        dwarf_appreladdr(debug_loc.seg, debug_loc.buf, seg, funcoffset + 1);
-        dwarf_appreladdr(debug_loc.seg, debug_loc.buf, seg, funcoffset + 3);
+            // set the entry for this function in .debug_loclists segment
+            // after call
+            write_regdesc
+            (
+                cast(ubyte)(DW_OP_breg0 + dwarf_regno(SP)),
+                cast(int)(Para.size - REGSIZE),
+                [
+                    TargetAddress(seg, funcoffset + 0),
+                    TargetAddress(seg, funcoffset + 1),
+                ]
+            );
 
-        loc_op = cast(ushort)(((Para.size) << 8) | (DW_OP_breg0 + dwarf_regno(SP)));
-        debug_loc.buf.write32(loc_op << 16 | op_size);
+            // after push EBP
+            write_regdesc
+            (
+                cast(ubyte)(DW_OP_breg0 + dwarf_regno(SP)),
+                cast(int)Para.size,
+                [
+                    TargetAddress(seg, funcoffset + 1),
+                    TargetAddress(seg, funcoffset + 3),
+                ]
+            );
 
-        // after mov EBP, ESP
-        dwarf_appreladdr(debug_loc.seg, debug_loc.buf, seg, funcoffset + 3);
-        dwarf_appreladdr(debug_loc.seg, debug_loc.buf, seg, funcoffset + sfunc.Ssize);
-
-        loc_op = cast(ushort)(((Para.size) << 8) | (DW_OP_breg0 + dwarf_regno(BP)));
-        debug_loc.buf.write32(loc_op << 16 | op_size);
-
-        // 2 zero addresses to end loc_list
-        append_addr(debug_loc.buf, 0);
-        append_addr(debug_loc.buf, 0);
+            // after mov EBP, ESP
+            write_regdesc
+            (
+                cast(ubyte)(DW_OP_breg0 + dwarf_regno(BP)),
+                cast(int)Para.size,
+                [
+                    TargetAddress(seg, funcoffset + 3),
+                    TargetAddress(seg, funcoffset + sfunc.Ssize),
+                ]
+            );
+        }
     }
 
 
@@ -1926,8 +2456,80 @@ static if (1)
     static if (0)
     void cv_outlist()
     {
+        // TODO
     }
 
+    /******************************************
+     * Write out symbol table for current function.
+     */
+    void cv_func(Funcsym *s)
+    {
+        // TODO
+    }
+
+    /*****************************************************
+     * Add `name` in .debug_str table
+     *
+     * Params:
+     *      name = string to add
+     * Returns:
+     *      Offset in .debug_str
+     */
+    uint dwarf_str_add(const(char)* name)
+    {
+        // TODO: check for duplicate entries, and return the corresponding offset
+        uint offset = cast(uint) debug_str.buf.length;
+
+        debug_str.buf.writeString(name);
+        debug_str.buf.writeByte(0);
+
+        return offset;
+    }
+
+
+    /*****************************************************
+     * Name Table Hash Function
+     *
+     * Params:
+     *      str = symbol name
+     *
+     * Return:
+     *      A hash for the Hash Lookup Table
+     */
+    uint dwarf_hash(ubyte* str)
+    {
+        uint hash = 5381;
+        int c = (*str)++;
+
+        while (c)
+        {
+            c = (*str)++;
+            hash = hash * 33 + c;
+        }
+
+        return hash;
+    }
+
+    /// Ditto
+    extern(D) uint dwarf_hash(string str)
+    {
+        return dwarf_hash((cast(ubyte[]) str).ptr);
+    }
+
+    /*****************************************************
+     * Allocates a `buffer`. If it is already allocated, reset it.
+     *
+     * Params:
+     *      buffer = Buffer which will be allocated
+     */
+    extern(D) void alloc_buf(ref Outbuffer* buffer)
+    {
+        if (buffer)
+            buffer.reset();
+        else
+            buffer = cast(Outbuffer*) calloc(1, Outbuffer.sizeof);
+        assert(buffer);
+    }
 
     /* =================== Cached Types in debug_info ================= */
 
@@ -1938,6 +2540,8 @@ static if (1)
 
         if (sflags & STRunion)
             return DW_TAG_union_type;
+
+        // TODO: DW_TAG_interface_type;
 
         return DW_TAG_structure_type;
     }
@@ -2022,11 +2626,26 @@ static if (1)
             DW_TAG_shared_type,     DW_CHILDREN_no,
             0,                      0,
         ];
+        static immutable ubyte[] abbrevTypeImmutable =
+        [
+            DW_TAG_immutable_type,  DW_CHILDREN_no,
+            DW_AT_type,             DW_FORM_ref4,
+            0,                      0,
+        ];
+        static immutable ubyte[] abbrevTypeImmutableVoid =
+        [
+            DW_TAG_immutable_type,  DW_CHILDREN_no,
+            0,                      0,
+        ];
 
         if (!t)
             return 0;
 
-        foreach(mty; [mTYconst, mTYshared, mTYvolatile])
+        auto types = [mTYconst, mTYshared, mTYvolatile];
+        if (config.dwarf >= 5)
+            types ~= mTYimmutable;
+
+        foreach(mty; types)
         {
             if (t.Tty & mty)
             {
@@ -2062,6 +2681,12 @@ static if (1)
                     code = nextidx
                         ? dwarf_abbrev_code(abbrevTypeShared)
                         : dwarf_abbrev_code(abbrevTypeSharedVoid);
+                }
+                else if (mty == mTYimmutable)
+                {
+                    code = nextidx
+                        ? dwarf_abbrev_code(abbrevTypeImmutable)
+                        : dwarf_abbrev_code(abbrevTypeImmutableVoid);
                 }
                 else
                     assert(0);
@@ -2103,6 +2728,17 @@ static if (1)
             DW_AT_data_member_location, DW_FORM_block1,
             0,                      0,
         ];
+
+        // TODO: DW_AT_accessibility
+        // TODO: DW_AT_alignment
+        // TODO: DW_AT_default_value
+        // TODO: DW_AT_deleted ?
+        // TODO: DW_AT_macros -> version = x ?
+        // TODO: DW_AT_main_subprogram (main)
+        // TODO: DW_AT_pure (pure)
+        // TODO: DW_AT_object_pointer (this)
+        // TODO: DW_AT_mutable ?
+        // TODO: DW_AT_visibility: DW_VIS_exported
 
         switch (tybasic(t.Tty))
         {
@@ -2826,39 +3462,48 @@ static if (1)
 
     extern(D) uint dwarf_abbrev_code(const(ubyte)[] data)
     {
-        return dwarf_abbrev_code(data.ptr, data.length);
+        return dwarf_abbrev_code_backend(data, abbrev_table,
+            abbrevcoed, debug_abbrev.buf);
     }
 
-    uint dwarf_abbrev_code(const(ubyte)* data, size_t nbytes)
+    extern(D) uint dwarf_names_abbrev_code(const(ubyte)[] data)
+    {
+        return dwarf_abbrev_code_backend(data, nAbbrevTable,
+            nAbbrevCode, nAbbrevBuffer);
+    }
+
+    extern(D) uint dwarf_abbrev_code_backend(const(ubyte)[] data,
+        ref AApair* abbrev_table, ref uint abbrevcode, ref Outbuffer* buffer)
     {
         if (!abbrev_table)
             /* uint[Adata] abbrev_table;
              * where the table values are the abbreviation codes.
              */
-            abbrev_table = AApair.create(&debug_abbrev.buf.buf);
+            abbrev_table = AApair.create(&buffer.buf);
 
-        /* Write new entry into debug_abbrev.buf
-         */
 
-        uint idx = cast(uint)debug_abbrev.buf.length();
+
+        // Write new entry into buffer
+
+        uint idx = cast(uint) buffer.length();
         abbrevcode++;
-        debug_abbrev.buf.writeuLEB128(abbrevcode);
-        size_t start = debug_abbrev.buf.length();
-        debug_abbrev.buf.write(data, cast(uint)nbytes);
-        size_t end = debug_abbrev.buf.length();
+        buffer.writeuLEB128(abbrevcode);
+        size_t start = buffer.length();
+        buffer.write(data);
+        size_t end = buffer.length();
 
-        /* If debug_abbrev.buf.buf[idx .. length()] is already in debug_abbrev.buf,
+        /* If debug_abbrev.buf.buf[idx .. length()] is already in buffer,
          * discard this one and use the previous one.
          */
 
-        uint *pcode = abbrev_table.get(cast(uint)start, cast(uint)end);
+        uint* pcode = abbrev_table.get(cast(uint)start, cast(uint)end);
         if (!*pcode)                // if no code assigned yet
         {
             *pcode = abbrevcode;    // assign newly computed code
         }
         else
         {   // Reuse existing code
-            debug_abbrev.buf.setsize(idx);        // discard current
+            buffer.setsize(idx);        // discard current
             abbrevcode--;
         }
         return *pcode;
