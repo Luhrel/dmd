@@ -565,6 +565,8 @@ static if (1)
         AApair *functype_table;  // not sure why this cannot be combined with type_table
         Outbuffer *functypebuf;
 
+        size_t infoMainSubOffset = 0;
+
         // .debug_line
         size_t linebuf_filetab_end;
         size_t lineHeaderLengthOffset;
@@ -590,6 +592,7 @@ static if (1)
         *(cast(T*)&buf.buf[offset]) = data;
     }
 
+    alias rewriteByte = rewrite!ubyte;
     alias rewrite32 = rewrite!uint;
     alias rewrite64 = rewrite!ulong;
 
@@ -1188,23 +1191,32 @@ static if (1)
                 abbrev_table = null;
             }
 
-            static immutable ubyte[21] abbrevHeader =
+            static immutable ubyte[19] abbrevHeader =
             [
                 1,                      // abbreviation code
-                DW_TAG_compile_unit,
-                1,
-                DW_AT_producer,  DW_FORM_string,
-                DW_AT_language,  DW_FORM_data1,
-                DW_AT_name,      DW_FORM_string,
-                DW_AT_comp_dir,  DW_FORM_string,
-                DW_AT_low_pc,    DW_FORM_addr,
-                DW_AT_entry_pc,  DW_FORM_addr,
-                DW_AT_ranges,    DW_FORM_data4,
-                DW_AT_stmt_list, DW_FORM_data4,
-                0,               0,
+                DW_TAG_compile_unit,    DW_CHILDREN_yes,
+                DW_AT_producer,         DW_FORM_string,
+                DW_AT_language,         DW_FORM_data1,
+                DW_AT_name,             DW_FORM_string,
+                DW_AT_comp_dir,         DW_FORM_string,
+                DW_AT_low_pc,           DW_FORM_addr,
+                DW_AT_entry_pc,         DW_FORM_addr,
+                DW_AT_ranges,           DW_FORM_data4,
+                DW_AT_stmt_list,        DW_FORM_data4,
             ];
+            debug_abbrev.buf.writen(abbrevHeader.ptr, abbrevHeader.sizeof);
 
-            debug_abbrev.buf.write(abbrevHeader.ptr,abbrevHeader.sizeof);
+            if (config.dwarf >= 4)
+            {
+                static immutable ubyte[2] abbrevHeaderMainSub =
+                [
+                    DW_AT_main_subprogram,      DW_FORM_flag,
+                ];
+                debug_abbrev.buf.writen(abbrevHeaderMainSub.ptr, abbrevHeaderMainSub.sizeof);
+            }
+
+            static immutable ubyte[2] abbrevHeaderEnd = [0, 0];
+            debug_abbrev.buf.writen(abbrevHeaderEnd.ptr, abbrevHeaderEnd.sizeof);
         }
 
         /* *********************************************************************
@@ -1293,6 +1305,9 @@ static if (1)
                 dwarf_addrel(debug_info.seg,debug_info.buf.length(),debug_line.seg);
 
             debug_info.buf.write32(0);                        // DW_AT_stmt_list
+
+            infoMainSubOffset = debug_info.buf.length();
+            debug_info.buf.writeByten(0);                       // DW_AT_main_subprogram
 
             memset(typidx_tab.ptr, 0, typidx_tab.sizeof);
         }
@@ -1877,6 +1892,9 @@ static if (1)
         else
             abuf.writeuLEB128(DW_AT_MIPS_linkage_name);
         abuf.writeByte(DW_FORM_string);
+
+        if (config.dwarf >= 4 && sfunc.Sfunc.Fflags3 & Fmain)
+            rewriteByte(debug_info.buf, infoMainSubOffset, true);
 
         abuf.writeByte(DW_AT_decl_file); abuf.writeByte(DW_FORM_data1);
         abuf.writeByte(DW_AT_decl_line); abuf.writeByte(DW_FORM_data2);

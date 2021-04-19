@@ -354,6 +354,9 @@ Symbol *toSymbol(Dsymbol s)
             else if (fd.isMember2() && fd.isStatic())
                 f.Fflags |= Fstatic;
 
+            if (fd.isMain())
+                f.Fflags3 |= Fmain;
+
             if (fd.type.toBasetype().isTypeFunction().nextOf().isTypeNoreturn())
                 s.Sflags |= SFLexit;    // the function never returns
 
